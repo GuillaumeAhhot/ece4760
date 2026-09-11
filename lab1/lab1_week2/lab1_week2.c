@@ -70,10 +70,10 @@ volatile int key_held = -1;
 volatile bool record_mode = false;
 
 volatile int playback_target = -1;
-volatile int play_index = 0;
+volatile int playback_index = 0;
 volatile bool playback_mode = false;
 
-static void determine_state(int key_val, 
+static void debounce_keypad(int key_val, 
                             int *state, 
                             int *prev_val,
                             int *confirmed_press_val, 
@@ -124,12 +124,15 @@ volatile unsigned int phase_accum_main;
 volatile unsigned int phase_incr_main = 0;
 volatile unsigned int desired_frequency = 800;
 volatile bool mute = false;
+volatile bool skip_next_event = false;
 
 #define MAX_AMPLITUDE 2048
 #define MUTE_AMPLITUDE 0
 #define AMPLITUDE_OFFSET 11
 
 volatile int amplitude = MAX_AMPLITUDE;
+volatile int amplitude_target = MAX_AMPLITUDE;
+#define AMPLITUDE_STEP 8
 
 #define sine_table_size 256
 volatile int sin_table[sine_table_size];
@@ -146,18 +149,40 @@ static void alarm_irq(void) {
     hw_clear_bits(&timer_hw->intr, 1u << ALARM_NUM);
     timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY;
 
-    phase_incr_main = (desired_frequency * two32) / Fs;
     phase_accum_main += phase_incr_main;
+
+    if (amplitude < amplitude_target){
+        amplitude += AMPLITUDE_STEP;
+        if (amplitude > amplitude_target){
+            amplitude = amplitude_target;
+        }
+    }
+    else if (amplitude > amplitude_target){
+        amplitude -= AMPLITUDE_STEP;
+        if (amplitude < amplitude_target){
+            amplitude = amplitude_target;
+        }
+    }
+
     DAC_data = (DAC_config_chan_B | (((sin_table[phase_accum_main >> 24]*amplitude >> AMPLITUDE_OFFSET) + 2048) & 0x0fff));
     spi_write16_blocking(SPI_PORT, &DAC_data, 1);
 
     gpio_put(ISR_GPIO, 0);
 }
 
+static void update_amplitude_target(void){
+    if (mute){
+        amplitude_target = MUTE_AMPLITUDE;
+    }
+    else{
+        amplitude_target = MAX_AMPLITUDE;
+    }
+}
+
 static void handle_key_event(int key_event){
     if (key_event == 0){
-        amplitude = mute ? MAX_AMPLITUDE : MUTE_AMPLITUDE;
         mute = !mute;
+        update_amplitude_target();
     }
     else if (key_event == 10){
         record_mode = !record_mode;
@@ -168,16 +193,18 @@ static void handle_key_event(int key_event){
     else if (key_event >= 1 && key_event <= 9){
         if (!record_mode && recording_length[key_event-1] > 0){
             playback_target = key_event;
-            play_index = 0;
+            playback_index = 0;
             playback_mode = true;
+            update_amplitude_target();
         }
     }
 }
 
 // ================= ADC read thread =================
-static PT_THREAD (protothread_toggle25(struct pt *pt))
+static PT_THREAD (protothread_sequencer(struct pt *pt))
 {
     PT_BEGIN(pt);
+    PT_INTERVAL_INIT();
     static unsigned int adc_val;
 
     while(1) {
@@ -185,20 +212,25 @@ static PT_THREAD (protothread_toggle25(struct pt *pt))
 
         adc_val = adc_read();
         if (playback_mode){
-            desired_frequency = recordings[playback_target-1][play_index];
-            play_index++;
-            if (play_index >= recording_length[playback_target-1]){
+            desired_frequency = recordings[playback_target-1][playback_index];
+            phase_incr_main = (desired_frequency * two32) / Fs;
+            playback_index++;
+            if (playback_index >= recording_length[playback_target-1]){
                 playback_mode = false;
             }
         }
         else{
             desired_frequency = (unsigned int)((10000.0 / 4095.0) * adc_val);
+            phase_incr_main = (desired_frequency * two32) / Fs;
         }
         
         printf("ADC value: %d\n", adc_val);
 
         if (key_event != -1){
-            handle_key_event(key_event);
+            if (!skip_next_event){
+                handle_key_event(key_event);
+            }
+            skip_next_event = false;
             key_event = -1;
         }
 
@@ -215,23 +247,20 @@ static PT_THREAD (protothread_toggle25(struct pt *pt))
         else if (recording_target != -1){
             recording_length[recording_target-1] = recording_index;
             recording_target = -1;
+            record_mode = false;
+            skip_next_event = true;
         }
 
-
-
-        PT_YIELD_usec(10000);
+        PT_YIELD_INTERVAL(10000);
     }
     PT_END(pt);
 }
 
-// ================= Keypad Thread ==================
-
-static PT_THREAD (protothread_core_0(struct pt *pt))
+// ================= Keypad thread =================
+static PT_THREAD (protothread_keypad(struct pt *pt))
 {
-    // Indicate thread beginning
     PT_BEGIN(pt) ;
 
-    // Some variables
     static int i ;
     static uint32_t keypad ;
     static int state = RESET_STATE;
@@ -242,31 +271,25 @@ static PT_THREAD (protothread_core_0(struct pt *pt))
 
     while(1) {
 
-        // Scan the keypad!
+        // drive one row low at a time, read the column pins
         for (i=0; i<KEYROWS; i++) {
-            // Set a row low
             gpio_put_masked((0xF << BASE_KEYPAD_PIN),
                             (scancodes[i] << BASE_KEYPAD_PIN)) ;
-            // Small delay required
             sleep_us(1) ;
-            // Read the keycode
             keypad = ((gpio_get_all() >> BASE_KEYPAD_PIN) & 0x7F) ;
-            // Break if button(s) are pressed
             if ((~keypad) & button) break ;
         }
-        // If we found a button . . .
+
+        // resolve scancode to key index, -1 for no press or invalid
         if ((~keypad) & button) {
-            // Look for a valid keycode.
             for (i=0; i<NUMKEYS; i++) {
                 if (keypad == keycodes[i]) break ;
             }
-            // If we don't find one, report invalid keycode
             if (i==NUMKEYS) (i = -1) ;
         }
-        // Otherwise, indicate invalid/non-pressed buttons
         else (i=-1) ;
 
-        determine_state(i, &state, &prev_val, &confirmed_press_val, &was_released, &key_held_local);
+        debounce_keypad(i, &state, &prev_val, &confirmed_press_val, &was_released, &key_held_local);
         key_held = key_held_local;
 
         if (was_released){
@@ -275,12 +298,10 @@ static PT_THREAD (protothread_core_0(struct pt *pt))
             confirmed_press_val = -1;
         }
 
-        // Print key to terminal
         printf("\n%d", i) ;
 
         PT_YIELD_usec(30000) ;
     }
-    // Indicate thread end
     PT_END(pt) ;
 }
 
@@ -337,7 +358,7 @@ int main(){
     irq_set_enabled(ALARM_IRQ, true);
     timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY;
 
-    pt_add_thread(protothread_core_0) ;
-    pt_add_thread(protothread_toggle25);
+    pt_add_thread(protothread_keypad) ;
+    pt_add_thread(protothread_sequencer);
     pt_schedule_start;
 }
