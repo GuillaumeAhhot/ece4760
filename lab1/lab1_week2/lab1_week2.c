@@ -10,12 +10,18 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "hardware/pio.h"
+#include "hardware/dma.h"
 #include "hardware/irq.h"
 #include "hardware/spi.h"
+#include "hardware/sync.h"
+#include "hardware/clocks.h"
 #include "hardware/gpio.h"
 #include "hardware/timer.h"
 #include "hardware/adc.h"
 #include "pico/stdlib.h"
+#include "pico/multicore.h"
+
 #include "pt_cornell_rp2040_v1_4.h"
 
 // ================= Pin / hardware config =================
@@ -34,6 +40,81 @@
 
 #define ISR_GPIO 2
 
+#define BASE_KEYPAD_PIN 9
+#define KEYROWS         4
+#define NUMKEYS         12
+
+// ================= Keypad Config ==================
+unsigned int keycodes[NUMKEYS] = {      0x57, 0x6E, 0x5E, 0x3E, 0x6D,
+                                        0x5D, 0x3D, 0x6B, 0x5B, 0x3B,
+                                        0x67, 0x37} ;
+unsigned int scancodes[KEYROWS] = {   0xE, 0xD, 0xB, 0x7} ;
+unsigned int button = 0x70 ;
+
+#define MAX_RECORDING_LEN 6000
+uint16_t recordings[9][MAX_RECORDING_LEN];
+
+volatile int recording_target = -1;
+volatile int recording_index = 0;
+int recording_length[9] = {0};
+
+char keytext[40];
+
+#define RESET_STATE 0
+#define MAYBE_YES_STATE 1
+#define CONFIRM_YES_STATE 2
+#define MAYBE_NOT_STATE 3 
+
+volatile int key_event = -1;
+volatile int key_held = -1;
+volatile bool record_mode = false;
+
+volatile int playback_target = -1;
+volatile int play_index = 0;
+volatile bool playback_mode = false;
+
+static void determine_state(int key_val, 
+                            int *state, 
+                            int *prev_val,
+                            int *confirmed_press_val, 
+                            bool *was_released,
+                            int *key_held){
+    switch(*state){
+        case RESET_STATE:
+            if (key_val != -1){
+                *prev_val = key_val;
+                *state = MAYBE_YES_STATE;
+            }
+            break;
+
+        case MAYBE_YES_STATE:
+            if (key_val == *prev_val){
+                *state = CONFIRM_YES_STATE;
+                *confirmed_press_val = key_val;
+                *key_held = key_val;
+            } else {
+                *state = RESET_STATE;
+            }
+            break;
+
+        case CONFIRM_YES_STATE:
+            if (key_val != *prev_val){
+                *state = MAYBE_NOT_STATE;
+            }
+            break;
+
+        case MAYBE_NOT_STATE:
+            if (key_val != *prev_val){
+                *state = RESET_STATE;
+                *was_released = true;
+                *key_held = -1;
+            } else {
+                *state = CONFIRM_YES_STATE;
+            }
+            break;
+    }
+}
+
 // ================= DDS parameters =================
 #define two32 4294967296.0 // 2^32
 #define Fs 50000
@@ -42,6 +123,13 @@
 volatile unsigned int phase_accum_main;
 volatile unsigned int phase_incr_main = 0;
 volatile unsigned int desired_frequency = 800;
+volatile bool mute = false;
+
+#define MAX_AMPLITUDE 2048
+#define MUTE_AMPLITUDE 0
+#define AMPLITUDE_OFFSET 11
+
+volatile int amplitude = MAX_AMPLITUDE;
 
 #define sine_table_size 256
 volatile int sin_table[sine_table_size];
@@ -60,10 +148,30 @@ static void alarm_irq(void) {
 
     phase_incr_main = (desired_frequency * two32) / Fs;
     phase_accum_main += phase_incr_main;
-    DAC_data = (DAC_config_chan_B | ((sin_table[phase_accum_main >> 24] + 2048) & 0xffff));
+    DAC_data = (DAC_config_chan_B | (((sin_table[phase_accum_main >> 24]*amplitude >> AMPLITUDE_OFFSET) + 2048) & 0x0fff));
     spi_write16_blocking(SPI_PORT, &DAC_data, 1);
 
     gpio_put(ISR_GPIO, 0);
+}
+
+static void handle_key_event(int key_event){
+    if (key_event == 0){
+        amplitude = mute ? MAX_AMPLITUDE : MUTE_AMPLITUDE;
+        mute = !mute;
+    }
+    else if (key_event == 10){
+        record_mode = !record_mode;
+    }
+    else if (key_event == 11){
+        //stub
+    }
+    else if (key_event >= 1 && key_event <= 9){
+        if (!record_mode && recording_length[key_event-1] > 0){
+            playback_target = key_event;
+            play_index = 0;
+            playback_mode = true;
+        }
+    }
 }
 
 // ================= ADC read thread =================
@@ -76,16 +184,111 @@ static PT_THREAD (protothread_toggle25(struct pt *pt))
         gpio_put(LED_PIN, !gpio_get(LED_PIN));
 
         adc_val = adc_read();
-        desired_frequency = (unsigned int)((10000.0 / 4095.0) * adc_val);
-
+        if (playback_mode){
+            desired_frequency = recordings[playback_target-1][play_index];
+            play_index++;
+            if (play_index >= recording_length[playback_target-1]){
+                playback_mode = false;
+            }
+        }
+        else{
+            desired_frequency = (unsigned int)((10000.0 / 4095.0) * adc_val);
+        }
+        
         printf("ADC value: %d\n", adc_val);
-        PT_YIELD_usec(100000);
+
+        if (key_event != -1){
+            handle_key_event(key_event);
+            key_event = -1;
+        }
+
+        if (record_mode && key_held >= 1 && key_held <= 9){
+            if (recording_target != key_held){
+                recording_target = key_held;
+                recording_index = 0;
+            }
+            if (recording_index < MAX_RECORDING_LEN){
+                recordings[key_held-1][recording_index] = (uint16_t) desired_frequency;
+                recording_index++;
+            }
+        }
+        else if (recording_target != -1){
+            recording_length[recording_target-1] = recording_index;
+            recording_target = -1;
+        }
+
+
+
+        PT_YIELD_usec(10000);
     }
     PT_END(pt);
 }
 
+// ================= Keypad Thread ==================
+
+static PT_THREAD (protothread_core_0(struct pt *pt))
+{
+    // Indicate thread beginning
+    PT_BEGIN(pt) ;
+
+    // Some variables
+    static int i ;
+    static uint32_t keypad ;
+    static int state = RESET_STATE;
+    static int prev_val = -1;
+    static int confirmed_press_val = -1;
+    static bool was_released = false;
+    static int key_held_local = -1;
+
+    while(1) {
+
+        // Scan the keypad!
+        for (i=0; i<KEYROWS; i++) {
+            // Set a row low
+            gpio_put_masked((0xF << BASE_KEYPAD_PIN),
+                            (scancodes[i] << BASE_KEYPAD_PIN)) ;
+            // Small delay required
+            sleep_us(1) ;
+            // Read the keycode
+            keypad = ((gpio_get_all() >> BASE_KEYPAD_PIN) & 0x7F) ;
+            // Break if button(s) are pressed
+            if ((~keypad) & button) break ;
+        }
+        // If we found a button . . .
+        if ((~keypad) & button) {
+            // Look for a valid keycode.
+            for (i=0; i<NUMKEYS; i++) {
+                if (keypad == keycodes[i]) break ;
+            }
+            // If we don't find one, report invalid keycode
+            if (i==NUMKEYS) (i = -1) ;
+        }
+        // Otherwise, indicate invalid/non-pressed buttons
+        else (i=-1) ;
+
+        determine_state(i, &state, &prev_val, &confirmed_press_val, &was_released, &key_held_local);
+        key_held = key_held_local;
+
+        if (was_released){
+            key_event = confirmed_press_val;
+            was_released = false;
+            confirmed_press_val = -1;
+        }
+
+        // Print key to terminal
+        printf("\n%d", i) ;
+
+        PT_YIELD_usec(30000) ;
+    }
+    // Indicate thread end
+    PT_END(pt) ;
+}
+
 // ================= main =================
 int main(){
+
+    set_sys_clock_khz(150000, true) ;
+
     stdio_init_all();
     printf("\n\rProtothreads RP2040 v1.4\n\r");
 
@@ -114,11 +317,27 @@ int main(){
         sin_table[ii] = (int)(2047 * sin((float)ii * 6.283 / (float)sine_table_size));
     }
 
+    ////////////////// KEYPAD INITS ///////////////////////
+    // Initialize the keypad GPIO's
+    gpio_init_mask((0x7F << BASE_KEYPAD_PIN)) ;
+    gpio_set_dir((BASE_KEYPAD_PIN+4), GPIO_IN);
+    gpio_set_dir((BASE_KEYPAD_PIN+5), GPIO_IN);
+    gpio_set_dir((BASE_KEYPAD_PIN+6), GPIO_IN);
+    // Set row-pins to output
+    gpio_set_dir_out_masked((0xF << BASE_KEYPAD_PIN)) ;
+    // Set all output pins to high
+    gpio_put_masked((0xF << BASE_KEYPAD_PIN), (0xF << BASE_KEYPAD_PIN)) ;
+    // Turn on pullup resistors for column pins
+    gpio_pull_up((BASE_KEYPAD_PIN+4)) ;
+    gpio_pull_up((BASE_KEYPAD_PIN+5)) ;
+    gpio_pull_up((BASE_KEYPAD_PIN+6)) ;
+
     hw_set_bits(&timer_hw->inte, 1u << ALARM_NUM);
     irq_set_exclusive_handler(ALARM_IRQ, alarm_irq);
     irq_set_enabled(ALARM_IRQ, true);
     timer_hw->alarm[ALARM_NUM] = timer_hw->timerawl + DELAY;
 
+    pt_add_thread(protothread_core_0) ;
     pt_add_thread(protothread_toggle25);
     pt_schedule_start;
 }

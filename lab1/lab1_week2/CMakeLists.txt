@@ -48,7 +48,10 @@ pico_enable_stdio_usb(lab1_week2 0)
 target_link_libraries(lab1_week2
     pico_stdlib
     pico_sync
+    pico_multicore
     hardware_sync
+    hardware_pio
+    hardware_dma
     hardware_clocks
     hardware_vreg
     hardware_adc
