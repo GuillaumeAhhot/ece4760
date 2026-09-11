@@ -3,12 +3,13 @@
  * ECE 4760, Week 3
  *
  * Slide pot sets the frequency of a DDS tone played out an MCP4822 DAC.
- * A 3x4 keypad adds mute (key 0), record (*), playback (keys 1-9, at
- * PLAYBACK_SPEED), and compose mode (#).
+ * A 3x4 keypad adds mute (0), record (*), per-key playback (1-9), and
+ * compose mode (#).
  *
- * Three execution contexts:
+ * Four execution contexts:
  *   alarm_irq              50 kHz   generates audio samples
- *   protothread_sequencer  100 Hz   reads pot, records, plays back, dispatches keys
+ *   protothread_playback    1 kHz   steps through a recording, 10x record rate
+ *   protothread_sequencer  100 Hz   reads pot, records, dispatches key events
  *   protothread_keypad     ~33 Hz   scans and debounces the keypad
  */
 
@@ -215,7 +216,8 @@ static PT_THREAD (protothread_keypad(struct pt *pt))
 }
 
 // ================= Record and playback =================
-// frequencies are stored at the 100 Hz sequencer rate, not the audio rate
+// frequencies are stored at the 100 Hz sequencer rate and read back at
+// 1 kHz, which is where the 10x playback speed comes from
 #define MAX_RECORDING_LEN 6000
 uint16_t recordings[9][MAX_RECORDING_LEN];
 int recording_length[9] = {0};
@@ -229,6 +231,8 @@ volatile int playback_index = 0;
 volatile bool playback_mode = false;
 
 // ================= Compose mode =================
+// compose_order holds the key sequence; playback walks it one recording
+// at a time, reusing the single-key playback machinery
 #define MAX_COMPOSE_LEN 100
 int compose_order[MAX_COMPOSE_LEN] = {0};
 volatile int compose_array_length = 0;
@@ -236,19 +240,20 @@ volatile int compose_seq_index = 0;
 volatile bool compose_mode_record = false;
 volatile bool compose_mode_playback = false;
 
-
 static void handle_key_event(int key){
     if (key == 0){
         mute = !mute;
         update_amplitude_target();
     }
     else if (key == 10){
+        // record mode is locked out while building a sequence
         if (!compose_mode_record){
             record_mode = !record_mode;
         }
     }
     else if (key == 11){
         if (compose_mode_record){
+            // second press: play the sequence just built
             if (compose_array_length > 0){
                 compose_mode_record = false;
                 compose_mode_playback = true;
@@ -259,6 +264,7 @@ static void handle_key_event(int key){
             }
         }
         else{
+            // start building a new sequence
             compose_array_length = 0;
             compose_seq_index = 0;
             compose_mode_record = true;
@@ -271,6 +277,7 @@ static void handle_key_event(int key){
                 compose_order[compose_array_length] = key;
                 compose_array_length++;
             }
+            // play the key as it is added, so the user hears what they picked
             if (recording_length[key-1] > 0){
                 playback_target = key;
                 playback_index = 0;
@@ -296,7 +303,9 @@ static PT_THREAD (protothread_playback(struct pt *pt))
             desired_frequency = recordings[playback_target-1][playback_index];
             phase_incr_main = (desired_frequency * two32) / Fs;
             playback_index++;
+
             if (playback_index >= recording_length[playback_target-1]){
+                // during a sequence, roll straight into the next recording
                 if (compose_mode_playback){
                     compose_seq_index++;
                     if (compose_seq_index < compose_array_length){
@@ -328,6 +337,7 @@ static PT_THREAD (protothread_sequencer(struct pt *pt))
     while(1) {
         gpio_put(LED_PIN, !gpio_get(LED_PIN));
 
+        // the pot drives the tone unless a recording is playing
         adc_val = adc_read();
         if (!playback_mode){
             desired_frequency = (unsigned int)((10000.0 / 4095.0) * adc_val);
@@ -339,6 +349,7 @@ static PT_THREAD (protothread_sequencer(struct pt *pt))
             key_event = -1;
         }
 
+        // record while a key is held, close out the recording on release
         if (record_mode && key_held >= 1 && key_held <= 9){
             if (recording_target != key_held){
                 recording_target = key_held;
