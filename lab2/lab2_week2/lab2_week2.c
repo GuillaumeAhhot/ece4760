@@ -152,6 +152,45 @@ fix15 GRAVITY = float2fix15(0.37) ;
 fix15 BOUNCINESS = float2fix15(0.5) ;
 fix15 COLLIDE_DIST ;
 
+// === histogram ==================================================
+// 17 bins: 15 gaps between the 16 bottom-row pegs, plus one outside each end.
+// Bottom-row pegs sit at x = 35 + 38k, so bin b spans x = 38b - 3 .. 38b + 35
+// and is centered at x = 38b + 16.
+#define NUM_BINS     (NUM_ROWS + 1)
+#define BOTTOM_PEG_X (PEG_X0 - (NUM_ROWS-1)*(PEG_DX/2))   // 35
+#define HIST_TOP     345
+#define HIST_BOTTOM  480
+#define HIST_H       (HIST_BOTTOM - HIST_TOP)
+#define BAR_W        32
+
+int hist[NUM_BINS] ;
+int hist_max = 0 ;
+int total_fallen = 0 ;
+
+static inline void recordBin(fix15 x)
+{
+  int px = fix2int15(x) ;
+  int bin ;
+  if (px < BOTTOM_PEG_X) bin = 0 ;
+  else {
+    bin = (px - BOTTOM_PEG_X) / PEG_DX + 1 ;
+    if (bin > NUM_BINS - 1) bin = NUM_BINS - 1 ;
+  }
+  hist[bin]++ ;
+  if (hist[bin] > hist_max) hist_max = hist[bin] ;
+  total_fallen++ ;
+}
+
+void drawHistogram()
+{
+  if (hist_max == 0) return ;
+  for (int b = 0; b < NUM_BINS; b++) {
+    // tallest bin always fills the full space under the board
+    int h = hist[b] * HIST_H / hist_max ;
+    if (h > 0) fillRect(b*PEG_DX, HIST_BOTTOM - h, BAR_W, h, MED_GREEN) ;
+  }
+}
+
 // === rotary encoder =============================================
 #define ENC_A 27
 #define ENC_B 28
@@ -169,11 +208,11 @@ void encoder_isr(uint gpio, uint32_t events)
 typedef struct {
   fix15 x, y, vx, vy ;
   int last_peg ;
-  bool active ;
 } ball_t ;
 
+// Packed array: balls[0 .. active_count-1] are live, everything above is unused.
 ball_t balls[MAX_BALLS] ;
-int high_water = 0 ;   // one past the highest active ball index
+int active_count = 0 ;
 
 void spawnBall(ball_t *b)
 {
@@ -182,7 +221,6 @@ void spawnBall(ball_t *b)
   b->vx = (fix15)((rand() & 0xffff) - 32768) >> 2 ;
   b->vy = 0 ;
   b->last_peg = -1 ;
-  b->active = true ;
 }
 
 void drawPegs()
@@ -275,6 +313,8 @@ int updateBall(ball_t *b)
   return 0 ;
 }
 
+#define ISR_GPIO 2
+
 static PT_THREAD (protothread_anim(struct pt *pt))
 {
     PT_BEGIN(pt);
@@ -283,38 +323,38 @@ static PT_THREAD (protothread_anim(struct pt *pt))
 
     while(1) {
       PT_YIELD_UNTIL(pt, draw_start_signal()) ;
+      gpio_put(ISR_GPIO, 1);
       clearLowFrame(0, BLACK);
       drawPegs() ;
+      drawHistogram() ;
 
       int target = encoder_count ;
-      int limit = (high_water > target) ? high_water : target ;
-      int spawned = 0 ;
-      int new_high = 0 ;
-      int active = 0 ;
 
-      for (int i = 0; i < limit; i++) {
-        ball_t *b = &balls[i] ;
+      // count went down: highest-index balls retire immediately
+      if (active_count > target) active_count = target ;
 
-        // spawn at most one new ball per frame so they don't stack
-        if (!b->active) {
-          if (i < target && !spawned) { spawnBall(b) ; spawned = 1 ; }
-          else continue ;
-        }
-
-        // fell out the bottom: respawn if still wanted, otherwise retire
-        if (updateBall(b)) {
-          if (i < target) spawnBall(b) ;
-          else { b->active = false ; continue ; }
-        }
-
-        fillCircle(fix2int15(b->x), fix2int15(b->y), BALL_RADIUS, CYAN) ;
-        new_high = i + 1 ;
-        active++ ;
+      // count went up: add one ball per frame so they don't stack
+      if (active_count < target) {
+        spawnBall(&balls[active_count]) ;
+        active_count++ ;
       }
-      high_water = new_high ;
 
-      sprintf(buf, "Balls: %d / %d", active, target) ;
+      for (int i = 0; i < active_count; i++) {
+        ball_t *b = &balls[i] ;
+        if (updateBall(b)) {
+          recordBin(b->x) ;
+          spawnBall(b) ;
+        }
+        fillCircle(fix2int15(b->x), fix2int15(b->y), BALL_RADIUS, CYAN) ;
+      }
+
+      sprintf(buf, "Balls: %d / %d", active_count, target) ;
       drawTextAscii(20, 20, buf, WHITE, BLACK);
+      sprintf(buf, "Fallen: %d", total_fallen) ;
+      drawTextAscii(20, 30, buf, WHITE, BLACK);
+      sprintf(buf, "Time: %d s", to_ms_since_boot(get_absolute_time()) / 1000) ;
+      drawTextAscii(20, 40, buf, WHITE, BLACK);
+      gpio_put(ISR_GPIO, 0);
     }
   PT_END(pt);
 }
@@ -335,6 +375,10 @@ int main(){
   gpio_init(ENC_B) ;
   gpio_set_dir(ENC_B, GPIO_IN) ;
   gpio_pull_up(ENC_B) ;
+
+    gpio_init(ISR_GPIO);
+    gpio_set_dir(ISR_GPIO, GPIO_OUT);
+    gpio_put(ISR_GPIO, 0);
 
   gpio_set_irq_enabled_with_callback(ENC_A, GPIO_IRQ_EDGE_FALL, true, &encoder_isr) ;
 
