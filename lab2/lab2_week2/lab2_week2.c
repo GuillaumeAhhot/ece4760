@@ -146,10 +146,10 @@ static inline void play_thunk() {
 #define PEG_RADIUS   6
 #define BALL_RADIUS  4
 
-#define MAX_BALLS    1000
+#define MAX_BALLS    2000
 
 fix15 GRAVITY = float2fix15(0.37) ;
-fix15 BOUNCINESS = float2fix15(0.5) ;
+fix15 BOUNCINESS = float2fix15(0.25) ;
 fix15 COLLIDE_DIST ;
 
 // === histogram ==================================================
@@ -195,7 +195,7 @@ void drawHistogram()
 #define ENC_A 27
 #define ENC_B 28
 
-volatile int encoder_count = 10 ;   // target ball count, starts at 10
+volatile int encoder_count = 1000 ;   // target ball count, starts at 10
 
 // One interrupt per detent: on A's falling edge, B's level gives direction.
 void encoder_isr(uint gpio, uint32_t events)
@@ -360,7 +360,7 @@ static PT_THREAD (protothread_anim(struct pt *pt))
 }
 
 int main(){
-  set_sys_clock_khz(150000, true) ;
+  set_sys_clock_khz(300000, true) ;
   stdio_init_all() ;
   initVGA() ;
 
