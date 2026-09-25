@@ -1,5 +1,5 @@
 /**
- * ECE 4760 Lab 2, Week 1 - Digital Galton Board
+ * ECE 4760 Lab 2 - Digital Galton Board
  * Based on Hunter Adams (vha3@cornell.edu) VGA and DMA demos
  *
  * HARDWARE CONNECTIONS
@@ -137,122 +137,183 @@ static inline void play_thunk() {
     dma_channel_start(ctrl_chan) ;
 }
 
+// === board geometry (Fig. 2) ====================================
+#define NUM_ROWS     16
+#define PEG_TOP_Y    40      // y of the top peg
+#define PEG_X0       320     // x of the top peg
+#define PEG_DX       38      // horizontal separation
+#define PEG_DY       19      // vertical separation
+#define PEG_RADIUS   6
+#define BALL_RADIUS  4
+
+#define MAX_BALLS    1000
+
+fix15 GRAVITY = float2fix15(0.37) ;
+fix15 BOUNCINESS = float2fix15(0.5) ;
+fix15 COLLIDE_DIST ;
+
 // === rotary encoder =============================================
 #define ENC_A 27
 #define ENC_B 28
 
-volatile int encoder_count = 0 ;
+volatile int encoder_count = 10 ;   // target ball count, starts at 10
 
 // One interrupt per detent: on A's falling edge, B's level gives direction.
 void encoder_isr(uint gpio, uint32_t events)
 {
-  if (gpio_get(ENC_B)) {
-    encoder_count++ ;
-    
-  }
-  else {
-    encoder_count-- ;
-  }
+  if (gpio_get(ENC_B)) { if (encoder_count < MAX_BALLS) encoder_count++ ; }
+  else                 { if (encoder_count > 0)         encoder_count-- ; }
 }
 
-// === Galton board parameters (Fig. 2) ===========================
-fix15 GRAVITY = float2fix15(0.37) ;
-fix15 BOUNCINESS = float2fix15(0.5) ;
+// === balls ======================================================
+typedef struct {
+  fix15 x, y, vx, vy ;
+  int last_peg ;
+  bool active ;
+} ball_t ;
 
-#define PEG_RADIUS   6
-#define BALL_RADIUS  4
+ball_t balls[MAX_BALLS] ;
+int high_water = 0 ;   // one past the highest active ball index
 
-fix15 COLLIDE_DIST ;
-
-char color = WHITE ;
-
-fix15 ball_x, ball_y, ball_vx, ball_vy ;
-fix15 peg_x, peg_y ;
-int last_peg ;
-
-void spawnBall()
+void spawnBall(ball_t *b)
 {
-  ball_x = int2fix15(320) ;
-  ball_y = int2fix15(0) ;
-  ball_vx = (fix15)((rand() & 0xffff) - 32768) >> 2 ;
-  ball_vy = 0 ;
-  last_peg = -1 ;
+  b->x = int2fix15(PEG_X0) ;
+  b->y = int2fix15(0) ;
+  b->vx = (fix15)((rand() & 0xffff) - 32768) >> 2 ;
+  b->vy = 0 ;
+  b->last_peg = -1 ;
+  b->active = true ;
 }
 
-void spawnPeg()
+void drawPegs()
 {
-  peg_x = int2fix15(320) ;
-  peg_y = int2fix15(240) ;
-}
-
-void updateBall(fix15* x, fix15* y, fix15* vx, fix15* vy)
-{
-  // y increases downward, so falling off the bottom is a large y
-  if (*y > int2fix15(480)) {
-    spawnBall() ;
-    return ;
-  }
-
-  *x = *x + *vx ;
-  *y = *y + *vy ;
-
-  fix15 dx = *x - peg_x ;
-  fix15 dy = *y - peg_y ;
-
-  // bounding-box reject before the expensive distance calc
-  if ((absfix15(dx) < COLLIDE_DIST) && (absfix15(dy) < COLLIDE_DIST)) {
-
-    fix15 distance = int2fix15(sqrt_i32(fix2int15(multfix15(dx,dx)) + fix2int15(multfix15(dy,dy)))) ;
-
-    if (distance < COLLIDE_DIST) {
-
-      fix15 normal_x = divfix(dx, distance) ;
-      fix15 normal_y = divfix(dy, distance) ;
-
-      fix15 intermediate_term = -2 * (multfix15(normal_x, *vx) + multfix15(normal_y, *vy)) ;
-
-      // push the ball back outside the collision radius so it can't stick
-      *x = peg_x + multfix15(normal_x, COLLIDE_DIST + int2fix15(1)) ;
-      *y = peg_y + multfix15(normal_y, COLLIDE_DIST + int2fix15(1)) ;
-
-      // only reflect if the ball is moving into the peg
-      if (intermediate_term > 0) {
-        *vx = *vx + multfix15(normal_x, intermediate_term) ;
-        *vy = *vy + multfix15(normal_y, intermediate_term) ;
-      }
-
-      // sound and energy loss fire once per contact, not every frame touching
-      if (last_peg != 0) {
-        last_peg = 0 ;
-        play_thunk() ;
-        *vx = multfix15(BOUNCINESS, *vx) ;
-        *vy = multfix15(BOUNCINESS, *vy) ;
-      }
+  for (int r = 0; r < NUM_ROWS; r++) {
+    int row_x0 = PEG_X0 - r*(PEG_DX/2) ;
+    int row_y  = PEG_TOP_Y + r*PEG_DY ;
+    for (int k = 0; k <= r; k++) {
+      fillCircle(row_x0 + k*PEG_DX, row_y, PEG_RADIUS, WHITE) ;
     }
   }
-  else {
-    last_peg = -1 ;
+}
+
+// Collide ball b against peg k of row r, if they overlap.
+static void collidePeg(ball_t *b, int r, int k)
+{
+  fix15 peg_x = int2fix15(PEG_X0 - r*(PEG_DX/2) + k*PEG_DX) ;
+  fix15 peg_y = int2fix15(PEG_TOP_Y + r*PEG_DY) ;
+
+  fix15 dx = b->x - peg_x ;
+  fix15 dy = b->y - peg_y ;
+
+  if ((absfix15(dx) >= COLLIDE_DIST) || (absfix15(dy) >= COLLIDE_DIST)) return ;
+
+  // distance in 1/256 px units, then back to fix15; avoids the whole-pixel
+  // truncation (and divide-by-zero) of doing the sqrt in integer pixels
+  int32_t dx8 = dx >> 7 ;
+  int32_t dy8 = dy >> 7 ;
+  fix15 distance = sqrt_i32(dx8*dx8 + dy8*dy8) << 7 ;
+
+  if (distance == 0 || distance >= COLLIDE_DIST) return ;
+
+  fix15 normal_x = divfix(dx, distance) ;
+  fix15 normal_y = divfix(dy, distance) ;
+
+  fix15 intermediate_term = -2 * (multfix15(normal_x, b->vx) + multfix15(normal_y, b->vy)) ;
+
+  // push the ball back outside the collision radius so it can't stick
+  b->x = peg_x + multfix15(normal_x, COLLIDE_DIST + int2fix15(1)) ;
+  b->y = peg_y + multfix15(normal_y, COLLIDE_DIST + int2fix15(1)) ;
+
+  // only reflect if the ball is moving into the peg
+  if (intermediate_term > 0) {
+    b->vx = b->vx + multfix15(normal_x, intermediate_term) ;
+    b->vy = b->vy + multfix15(normal_y, intermediate_term) ;
   }
 
-  *vy = *vy + GRAVITY ;
+  // sound and energy loss only on a new peg
+  int peg_id = r*NUM_ROWS + k ;
+  if (b->last_peg != peg_id) {
+    b->last_peg = peg_id ;
+    play_thunk() ;
+    b->vx = multfix15(BOUNCINESS, b->vx) ;
+    b->vy = multfix15(BOUNCINESS, b->vy) ;
+  }
+}
+
+// Returns 1 if the ball fell out the bottom this frame.
+int updateBall(ball_t *b)
+{
+  // y increases downward, so falling off the bottom is a large y
+  if (b->y > int2fix15(480)) return 1 ;
+
+  b->x = b->x + b->vx ;
+  b->y = b->y + b->vy ;
+
+  // Instead of testing all 136 pegs, compute which pegs could be touching.
+  // Rows are 19 px apart and the collision distance is 10 px, so only the
+  // row above and below the ball can be in range. Within a row pegs are
+  // 38 px apart, so only the nearest one can be in range.
+  int px = fix2int15(b->x) ;
+  int py = fix2int15(b->y) ;
+  int r0 = (py - PEG_TOP_Y) / PEG_DY ;
+
+  for (int r = r0; r <= r0 + 1; r++) {
+    if (r < 0 || r >= NUM_ROWS) continue ;
+    int rel = px - (PEG_X0 - r*(PEG_DX/2)) + PEG_DX/2 ;
+    if (rel < 0) continue ;
+    int k = rel / PEG_DX ;
+    if (k > r) continue ;
+    collidePeg(b, r, k) ;
+  }
+
+  // side and top walls
+  if (b->x < int2fix15(BALL_RADIUS) && b->vx < 0)        b->vx = -b->vx ;
+  if (b->x > int2fix15(639 - BALL_RADIUS) && b->vx > 0)  b->vx = -b->vx ;
+  if (b->y < int2fix15(BALL_RADIUS) && b->vy < 0)        b->vy = -b->vy ;
+
+  b->vy = b->vy + GRAVITY ;
+  return 0 ;
 }
 
 static PT_THREAD (protothread_anim(struct pt *pt))
 {
     PT_BEGIN(pt);
 
-    spawnPeg() ;
-    spawnBall() ;
+    static char buf[40] ;
 
     while(1) {
       PT_YIELD_UNTIL(pt, draw_start_signal()) ;
       clearLowFrame(0, BLACK);
-      updateBall(&ball_x, &ball_y, &ball_vx, &ball_vy) ;
-      fillCircle(fix2int15(peg_x), fix2int15(peg_y), PEG_RADIUS, WHITE);
-      fillCircle(fix2int15(ball_x), fix2int15(ball_y), BALL_RADIUS, color);
+      drawPegs() ;
 
-      static char buf[20] ;
-      sprintf(buf, "Count: %d", encoder_count) ;
+      int target = encoder_count ;
+      int limit = (high_water > target) ? high_water : target ;
+      int spawned = 0 ;
+      int new_high = 0 ;
+      int active = 0 ;
+
+      for (int i = 0; i < limit; i++) {
+        ball_t *b = &balls[i] ;
+
+        // spawn at most one new ball per frame so they don't stack
+        if (!b->active) {
+          if (i < target && !spawned) { spawnBall(b) ; spawned = 1 ; }
+          else continue ;
+        }
+
+        // fell out the bottom: respawn if still wanted, otherwise retire
+        if (updateBall(b)) {
+          if (i < target) spawnBall(b) ;
+          else { b->active = false ; continue ; }
+        }
+
+        fillCircle(fix2int15(b->x), fix2int15(b->y), BALL_RADIUS, CYAN) ;
+        new_high = i + 1 ;
+        active++ ;
+      }
+      high_water = new_high ;
+
+      sprintf(buf, "Balls: %d / %d", active, target) ;
       drawTextAscii(20, 20, buf, WHITE, BLACK);
     }
   PT_END(pt);

@@ -81,7 +81,7 @@ static void alarm_irq(void) {
 
 	// DDS phase and sine table lookup
 	phase_accum_main += phase_incr_main  ;
-    DAC_data = (DAC_config_chan_B | ((sin_table[phase_accum_main>>24] + 2048) & 0xffff))  ;
+    DAC_data = (DAC_config_chan_A | ((sin_table[phase_accum_main>>24] + 2048) & 0xffff))  ;
 
     // Perform an SPI transaction
     spi_write16_blocking(SPI_PORT, &DAC_data, 1) ;
