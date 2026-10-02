@@ -149,7 +149,7 @@ static inline void play_thunk() {
 #define MAX_BALLS    2000
 
 fix15 GRAVITY = float2fix15(0.37) ;
-fix15 BOUNCINESS = float2fix15(0.25) ;
+fix15 BOUNCINESS = float2fix15(0.4) ;
 fix15 COLLIDE_DIST ;
 
 // === histogram ==================================================
