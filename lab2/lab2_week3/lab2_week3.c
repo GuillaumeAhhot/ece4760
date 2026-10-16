@@ -9,11 +9,13 @@
  *  - GPIO 19 ---> VGA Green hi-bit --> 330 ohm resistor --> VGA-Green
  *  - GPIO 20 ---> 330 ohm resistor ---> VGA-Blue
  *  - GPIO 21 ---> 330 ohm resistor ---> VGA-Red
+ *    (1-bit color: only GPIO 19 carries pixels, the rest stay low)
  *  - GPIO 4/5/6/7 ---> SPI0 MISO/CS/SCK/MOSI; DAC uses CS/SCK/MOSI
  *  - MCP4822 VOUTA ---> amp
  *  - GPIO 27/28 ---> encoder A/B, encoder COM ---> GND
  *  - GPIO 15 ---> encoder switch, other switch pin ---> GND
- *  - GPIO 2 ---> scope (high while computing a frame)
+ *  - GPIO 2 ---> scope: core 0 busy (low while waiting on core 1)
+ *  - GPIO 3 ---> scope: core 1 busy
  *  - GPIO 25 ---> onboard LED (on when the 60 fps deadline is missed)
  *  - GND ---> VGA-GND
  *
@@ -22,10 +24,11 @@
  *  - 4 DMA channels (VGA library) + 2 DMA channels (audio)
  *  - DMA pacing timer 0, SPI0
  *  - Both cores, 2 semaphores
- *  - 307.2 kB RAM (2 framebuffers) + 180 kB (balls and peg IDs)
+ *  - 76.8 kB RAM (2 framebuffers, 1 bit/pixel) + 400 kB (balls)
+ *  - Ball loop runs from RAM
  */
 
-#include "VGA/vga16_graphics_v3.h"
+#include "VGA/vga1_graphics.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,8 +49,13 @@
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
 #include "hardware/sync.h"
+#include "hardware/vreg.h"
+#include "hardware/structs/qmi.h"
 
 #include "pt_cornell_rp2040_v1_4.h"
+
+// Force inlining so the hot path stays inside the RAM-resident ball loop.
+#define HOT static inline __attribute__((always_inline))
 
 /* Fixed-point arithmetic */
 
@@ -65,32 +73,7 @@ typedef int32_t fix15;
 #define divfix(a,b) \
   ((fix15)div_s64s64((int64_t)(a) * 32768LL, (int64_t)(b)))
 
-// Integer square root for nonnegative inputs.
-static int32_t sqrt_i32(int32_t v)
-{
-  uint32_t b = 1u << 30;
-  uint32_t q = 0;
-  uint32_t r = v;
-
-  while (b > r)
-    b >>= 2;
-
-  while (b > 0) {
-    uint32_t t = q + b;
-    q >>= 1;
-
-    if (r >= t) {
-      r -= t;
-      q += b;
-    }
-
-    b >>= 2;
-  }
-
-  return q;
-}
-
-/* Drawing */
+/* Drawing (1 bit per pixel, bit 0 of each byte is the leftmost pixel) */
 
 // Disc half-widths, from the top row to the bottom row.
 static const int8_t ball_hw[9] = {
@@ -101,37 +84,106 @@ static const int8_t peg_hw[13] = {
   2, 4, 5, 5, 6, 6, 6, 6, 6, 5, 5, 4, 2
 };
 
-extern char *current_draw_buffer;
+// Edge pixels at each end of a row.
+// Top and bottom rows are drawn across their full width.
+static const int8_t ball_edge[9] = {
+  4, 1, 1, 1, 1, 1, 1, 1, 4
+};
 
-// Write a filled disc directly into the framebuffer, two pixels per byte.
-static inline void drawDiscFast(
-  int x, int y, const int8_t *hw, int r, char color)
+static const int8_t peg_edge[13] = {
+  4, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 4
+};
+
+// Outline bit pattern per row; bit i is pixel (x - r + i).
+static uint32_t ball_rows[9];
+static uint32_t peg_rows[13];
+
+// Precompute outline patterns from the half-width and edge tables.
+static void buildRows(
+  uint32_t *rows, const int8_t *hw, const int8_t *edge, int r)
+{
+  for (int i = 0; i <= 2 * r; i++) {
+    int left = r - hw[i];
+    int width = 2 * hw[i];
+    int n = edge[i];
+
+    if (2 * n >= width) {
+      rows[i] = ((1u << width) - 1) << left;
+    } else {
+      uint32_t ends = (1u << n) - 1;
+      rows[i] = (ends << left) | (ends << (left + width - n));
+    }
+  }
+}
+
+// OR a precomputed sprite into the framebuffer: one shift per row, no branches.
+HOT void drawSprite(int x, int y, const uint32_t *rows, int r)
 {
   if (y < r || y > 479 - r || x < r || x > 639 - r)
     return;
 
-  char both = color | (color << 4);
-  char *row = current_draw_buffer + 320 * (y - r);
+  int sx = x - r;
+  int sh = sx & 7;
+  uint8_t *p = (uint8_t *)current_draw_buffer
+               + VGA_ROW_BYTES * (y - r) + (sx >> 3);
 
-  for (int i = 0; i <= 2 * r; i++, row += 320) {
-    int x0 = x - hw[i];
-    int n = 2 * hw[i];
-    char *p = row + (x0 >> 1);
+  for (int i = 0; i <= 2 * r; i++, p += VGA_ROW_BYTES) {
+    uint32_t m = rows[i] << sh;
 
-    if (x0 & 1) {
-      // Preserve the neighboring pixels at both ends.
-      *p = (*p & 0x0F) | (color << 4);
-      p++;
+    p[0] |= (uint8_t)m;
+    p[1] |= (uint8_t)(m >> 8);
 
-      for (int j = 0; j < (n - 2) / 2; j++)
-        *p++ = both;
-
-      *p = (*p & 0xF0) | color;
-    } else {
-      for (int j = 0; j < n / 2; j++)
-        *p++ = both;
-    }
+    // Pegs are 12 px wide and can span 3 bytes; folds away for balls.
+    if (r > 4)
+      p[2] |= (uint8_t)(m >> 16);
   }
+}
+
+// Light pixels [x, x + w) in one row.
+static inline void hspan(uint8_t *row, int x, int w)
+{
+  int x1 = x + w - 1;
+  int b0 = x >> 3;
+  int b1 = x1 >> 3;
+  uint8_t m0 = (uint8_t)(0xFF << (x & 7));
+  uint8_t m1 = (uint8_t)(0xFF >> (7 - (x1 & 7)));
+
+  if (b0 == b1) {
+    row[b0] |= m0 & m1;
+    return;
+  }
+
+  row[b0] |= m0;
+
+  for (int b = b0 + 1; b < b1; b++)
+    row[b] = 0xFF;
+
+  row[b1] |= m1;
+}
+
+// Draw a rectangle outline; w and h are pixel counts.
+static inline void drawRectOutlineFast(int x, int y, int w, int h)
+{
+  if (w <= 0 || h <= 0 ||
+      x < 0 || y < 0 || x + w > 640 || y + h > 480)
+    return;
+
+  uint8_t *row = (uint8_t *)current_draw_buffer + VGA_ROW_BYTES * y;
+  int lb = x >> 3;
+  int rb = (x + w - 1) >> 3;
+  uint8_t lm = (uint8_t)(1u << (x & 7));
+  uint8_t rm = (uint8_t)(1u << ((x + w - 1) & 7));
+
+  hspan(row, x, w);
+
+  for (int i = 1; i < h - 1; i++) {
+    row += VGA_ROW_BYTES;
+    row[lb] |= lm;
+    row[rb] |= rm;
+  }
+
+  if (h > 1)
+    hspan(row + VGA_ROW_BYTES, x, w);
 }
 
 /* Audio */
@@ -228,21 +280,26 @@ static inline void play_thunk()
 #define EXIT_Y \
   (PEG_TOP_Y + (NUM_ROWS - 1) * PEG_DY + PEG_RADIUS + BALL_RADIUS)
 
-#define MAX_BALLS       20000
-#define START_BALLS     10000
-#define SPAWN_PER_FRAME 10
+#define MAX_BALLS       54000
+#define START_BALLS     54000
+#define SPAWN_PER_FRAME 100
+
+// Extra balls given to core 1 (core 0 also does the clear, pegs and text).
+// Tune with the scope on GPIO 2 and 3.
+#define CORE1_EXTRA     0
 
 fix15 GRAVITY = float2fix15(0.37);
-fix15 BOUNCINESS = float2fix15(0.3);
+fix15 BOUNCINESS = float2fix15(0.4);
 fix15 COLLIDE_DIST;
 
 /* User interface */
 
-#define ENC_A    27
-#define ENC_B    28
-#define ENC_SW   15
-#define LED_PIN  25
-#define ISR_GPIO 2
+#define ENC_A      27
+#define ENC_B      28
+#define ENC_SW     15
+#define LED_PIN    25
+#define CORE0_GPIO 2
+#define CORE1_GPIO 3
 
 #define BALL_STEP   10
 #define BOUNCE_STEP float2fix15(0.05)
@@ -281,11 +338,17 @@ void encoder_isr(uint gpio, uint32_t events)
 int hist[2][NUM_BINS];
 int fallen[2];
 
+// Cached histogram labels, refreshed once per second.
+static uint8_t hist_text_pixels[VGA_ROW_BYTES * (HIST_TOP - HIST_TEXT_Y)];
+static uint32_t hist_text_updated = 0;
+static bool hist_text_dirty = true;
+
 // Called while core 1 is idle.
 void resetHistogram()
 {
   memset(hist, 0, sizeof(hist));
   fallen[0] = fallen[1] = 0;
+  hist_text_dirty = true;
 }
 
 // Assign an exiting ball to one of the 17 bins.
@@ -307,10 +370,10 @@ static inline void recordBin(fix15 x, int core)
   fallen[core]++;
 }
 
-// Draw combined counts and scale the tallest bar to the available height.
+// Update bars each frame and regenerate count labels once per second.
 void drawHistogram()
 {
-  static char cnt[8];
+  char cnt[12];
   int sum[NUM_BINS];
   int maxv = 0;
 
@@ -321,17 +384,39 @@ void drawHistogram()
       maxv = sum[b];
   }
 
+  uint32_t now = time_us_32();
+  char *text_area = current_draw_buffer + VGA_ROW_BYTES * HIST_TEXT_Y;
+
+  if (hist_text_dirty ||
+      (uint32_t)(now - hist_text_updated) >= 1000000u) {
+    // Clear the label strip before rendering the new counts.
+    memset(text_area, 0, sizeof(hist_text_pixels));
+
+    for (int b = 0; b < NUM_BINS; b++) {
+      snprintf(cnt, sizeof(cnt), "%d", sum[b]);
+
+      drawTextAscii(
+        b * PEG_DX + 2, HIST_TEXT_Y, cnt, WHITE, BLACK
+      );
+    }
+
+    memcpy(hist_text_pixels, text_area, sizeof(hist_text_pixels));
+
+    hist_text_updated = now;
+    hist_text_dirty = false;
+  } else {
+    // Restore the cached labels after the frame clear.
+    memcpy(text_area, hist_text_pixels, sizeof(hist_text_pixels));
+  }
+
+  if (maxv == 0)
+    return;
+
   for (int b = 0; b < NUM_BINS; b++) {
-    sprintf(cnt, "%d", sum[b]);
-    drawTextAscii(b * PEG_DX + 2, HIST_TEXT_Y, cnt, WHITE, BLACK);
-
-    if (maxv == 0)
-      continue;
-
-    int h = sum[b] * HIST_H / maxv;
+    int h = (int)((int64_t)sum[b] * HIST_H / maxv);
 
     if (h > 0)
-      fillRect(b * PEG_DX, HIST_BOTTOM - h, BAR_W, h, MED_GREEN);
+      drawRectOutlineFast(b * PEG_DX, HIST_BOTTOM - h, BAR_W, h);
   }
 }
 
@@ -355,11 +440,9 @@ typedef struct {
 #define VEL_STORE(v) ((int16_t)(((v) + (1 << 5)) >> 6))
 
 #define POS_TO_PX(p) ((p) >> 5)
-#define NO_PEG      255
 
 // Entries below active_count are live.
 ball_t balls[MAX_BALLS];
-uint8_t last_peg[MAX_BALLS];
 int active_count = 0;
 
 static uint32_t rng_state[2] = {
@@ -389,31 +472,25 @@ void spawnBall(int i, int core)
   b->y = 0;
   b->vx = VEL_STORE(launch >> 2);
   b->vy = 0;
-
-  last_peg[i] = NO_PEG;
 }
 
-// Draw the triangular array of pegs.
+// Draw the triangular array of peg outlines.
 void drawPegs()
 {
   for (int r = 0; r < NUM_ROWS; r++) {
     int row_x0 = PEG_X0 - r * (PEG_DX / 2);
     int row_y = PEG_TOP_Y + r * PEG_DY;
 
-    for (int k = 0; k <= r; k++) {
-      drawDiscFast(
-        row_x0 + k * PEG_DX,
-        row_y,
-        peg_hw,
-        PEG_RADIUS,
-        WHITE
-      );
-    }
+    for (int k = 0; k <= r; k++)
+      drawSprite(row_x0 + k * PEG_DX, row_y, peg_rows, PEG_RADIUS);
   }
 }
 
+// intermediate_term is 2x the impact speed, so this is 1 px/frame.
+#define IMPACT_MIN int2fix15(2)
+
 // Resolve an overlap with peg k in row r.
-static void collidePeg(ball_state_t *s, uint8_t *lp, int r, int k)
+HOT void collidePeg(ball_state_t *s, int r, int k)
 {
   fix15 peg_x = int2fix15(
     PEG_X0 - r * (PEG_DX / 2) + k * PEG_DX
@@ -423,54 +500,62 @@ static void collidePeg(ball_state_t *s, uint8_t *lp, int r, int k)
   fix15 dx = s->x - peg_x;
   fix15 dy = s->y - peg_y;
 
-  if (absfix15(dx) >= COLLIDE_DIST ||
-      absfix15(dy) >= COLLIDE_DIST)
+  fix15 ax = absfix15(dx);
+  fix15 ay = absfix15(dy);
+
+  if (ax >= COLLIDE_DIST || ay >= COLLIDE_DIST)
     return;
 
-  // Compute distance in 1/256-pixel units, then convert back to fix15.
-  int32_t dx8 = dx >> 7;
-  int32_t dy8 = dy >> 7;
-  fix15 distance = sqrt_i32(dx8 * dx8 + dy8 * dy8) << 7;
+  fix15 largest = (ax > ay) ? ax : ay;
+  fix15 smallest = (ax > ay) ? ay : ax;
+
+  // Alpha = 123/128, beta = 51/128.
+  fix15 distance = (123 * largest + 51 * smallest) >> 7;
 
   if (distance == 0 || distance >= COLLIDE_DIST)
     return;
 
-  fix15 normal_x = divfix(dx, distance);
-  fix15 normal_y = divfix(dy, distance);
+  // Share one 32-bit division between both normal components.
+  uint32_t inv_distance = (1u << 30) / (uint32_t)distance;
+
+  // Unsigned products preserve the full 32-bit magnitude.
+  fix15 normal_x = (fix15)(
+    ((uint32_t)ax * inv_distance) >> 15
+  );
+  fix15 normal_y = (fix15)(
+    ((uint32_t)ay * inv_distance) >> 15
+  );
+
+  if (dx < 0)
+    normal_x = -normal_x;
+
+  if (dy < 0)
+    normal_y = -normal_y;
 
   fix15 intermediate_term = -2 * (
     multfix15(normal_x, s->vx) +
     multfix15(normal_y, s->vy)
   );
 
-  // Move the ball just outside the peg.
-  s->x = peg_x + multfix15(
-    normal_x, COLLIDE_DIST + int2fix15(1)
-  );
-  s->y = peg_y + multfix15(
-    normal_y, COLLIDE_DIST + int2fix15(1)
-  );
+  // The push-out distance is an integer number of pixels.
+  s->x = peg_x + normal_x * (PEG_RADIUS + BALL_RADIUS + 1);
+  s->y = peg_y + normal_y * (PEG_RADIUS + BALL_RADIUS + 1);
 
-  // Reflect only when the ball is moving into the peg.
   if (intermediate_term > 0) {
-    s->vx += multfix15(normal_x, intermediate_term);
-    s->vy += multfix15(normal_y, intermediate_term);
-  }
+      s->vx += multfix15(normal_x, intermediate_term);
+      s->vy += multfix15(normal_y, intermediate_term);
 
-  // Peg IDs run from 0 to 135.
-  uint8_t peg_id = r * (r + 1) / 2 + k;
+      if (intermediate_term > IMPACT_MIN) {
+        play_thunk();
 
-  if (*lp != peg_id) {
-    *lp = peg_id;
-    play_thunk();
-
-    s->vx = multfix15(BOUNCINESS, s->vx);
-    s->vy = multfix15(BOUNCINESS, s->vy);
-  }
+        s->vx = multfix15(BOUNCINESS, s->vx);
+        s->vy = multfix15(BOUNCINESS, s->vy);
+      }
+    }
 }
 
-// Advance one frame; return 1 if the ball has cleared the board.
-int updateBall(ball_state_t *s, uint8_t *lp)
+// Advance one frame: 0 = active, 1 = bottom exit, 2 = screen escape.
+HOT int updateBall(ball_state_t *s)
 {
   if (s->y > int2fix15(EXIT_Y))
     return 1;
@@ -483,26 +568,22 @@ int updateBall(ball_state_t *s, uint8_t *lp)
       s->y < 0 || s->y > int2fix15(479))
     return 2;
 
-  // Check the nearest peg in each of the two candidate rows.
+  // Nearest row only: rows are 19 px apart and the collision range is 10,
+  // so a ball can't touch pegs in two rows at once. A graze in the 1 px
+  // band between rows is caught one frame later.
   int px = fix2int15(s->x);
   int py = fix2int15(s->y);
-  int r0 = (py - PEG_TOP_Y) / PEG_DY;
+  int r = (py - PEG_TOP_Y + PEG_DY / 2) / PEG_DY;
 
-  for (int r = r0; r <= r0 + 1; r++) {
-    if (r < 0 || r >= NUM_ROWS)
-      continue;
-
+  if (r >= 0 && r < NUM_ROWS) {
     int rel = px - (PEG_X0 - r * (PEG_DX / 2)) + PEG_DX / 2;
 
-    if (rel < 0)
-      continue;
+    if (rel >= 0) {
+      int k = rel / PEG_DX;
 
-    int k = rel / PEG_DX;
-
-    if (k > r)
-      continue;
-
-    collidePeg(s, lp, r, k);
+      if (k <= r)
+        collidePeg(s, r, k);
+    }
   }
 
   s->vy += GRAVITY;
@@ -559,8 +640,8 @@ void handleInput()
     resetHistogram();
 }
 
-// Update and draw each core's share of the balls.
-static void processBalls(int start, int end, int core)
+// Update and draw each core's share of the balls (runs from RAM).
+static void __not_in_flash_func(processBalls)(int start, int end, int core)
 {
   for (int i = start; i < end; i++) {
     ball_t *b = &balls[i];
@@ -570,7 +651,7 @@ static void processBalls(int start, int end, int core)
       VEL_LOAD(b->vx), VEL_LOAD(b->vy)
     };
 
-    int result = updateBall(&s, &last_peg[i]);
+    int result = updateBall(&s);
 
     if (result != 0) {
       if (result == 1)
@@ -600,13 +681,7 @@ static void processBalls(int start, int end, int core)
         b->vx = (r & 1u) ? 1 : -1;
     }
 
-    drawDiscFast(
-      POS_TO_PX(b->x),
-      POS_TO_PX(b->y),
-      ball_hw,
-      BALL_RADIUS,
-      CYAN
-    );
+    drawSprite(POS_TO_PX(b->x), POS_TO_PX(b->y), ball_rows, BALL_RADIUS);
   }
 }
 
@@ -616,6 +691,7 @@ semaphore_t sem_start, sem_done;
 volatile int core1_start, core1_end;
 
 // Core 1 processes its assigned range, then signals completion.
+// GPIO 3 is high while it works.
 static PT_THREAD(protothread_anim1(struct pt *pt))
 {
   PT_BEGIN(pt);
@@ -623,7 +699,9 @@ static PT_THREAD(protothread_anim1(struct pt *pt))
   while (1) {
     PT_SEM_SDK_WAIT(pt, &sem_start);
 
+    gpio_put(CORE1_GPIO, 1);
     processBalls(core1_start, core1_end, 1);
+    gpio_put(CORE1_GPIO, 0);
 
     PT_SEM_SDK_SIGNAL(pt, &sem_done);
   }
@@ -639,6 +717,7 @@ void core1_main()
 }
 
 // Core 0 prepares each frame and waits for both ball ranges to finish.
+// GPIO 2 is high while core 0 works and drops while it waits on core 1.
 static PT_THREAD(protothread_anim(struct pt *pt))
 {
   PT_BEGIN(pt);
@@ -652,7 +731,7 @@ static PT_THREAD(protothread_anim(struct pt *pt))
     PT_YIELD_UNTIL(pt, draw_start_signal());
 
     t_start = time_us_32();
-    gpio_put(ISR_GPIO, 1);
+    gpio_put(CORE0_GPIO, 1);
 
     handleInput();
 
@@ -671,15 +750,22 @@ static PT_THREAD(protothread_anim(struct pt *pt))
       active_count++;
     }
 
-    int half = active_count / 2;
-    core1_start = half;
+    // Core 0 takes [0, split), core 1 takes [split, active_count).
+    int split = (active_count - CORE1_EXTRA) / 2;
+
+    if (split < 0)
+      split = 0;
+
+    core1_start = split;
     core1_end = active_count;
 
     PT_SEM_SDK_SIGNAL(pt, &sem_start);
 
-    processBalls(0, half, 0);
+    processBalls(0, split, 0);
 
+    gpio_put(CORE0_GPIO, 0);
     PT_SEM_SDK_WAIT(pt, &sem_done);
+    gpio_put(CORE0_GPIO, 1);
 
     sprintf(buf, "Balls: %d", target_balls);
     drawTextAscii(20, 10, buf, WHITE, BLACK);
@@ -708,20 +794,34 @@ static PT_THREAD(protothread_anim(struct pt *pt))
     // Report the time spent computing this frame.
     frame_us = time_us_32() - t_start;
     gpio_put(LED_PIN, frame_us > 16667);
-    gpio_put(ISR_GPIO, 0);
+    gpio_put(CORE0_GPIO, 0);
   }
 
   PT_END(pt);
 }
 
+// Slow the flash clock before raising the system clock (runs from RAM).
+static void __no_inline_not_in_flash_func(set_flash_divider)(uint div)
+{
+  uint32_t t = qmi_hw->m[0].timing;
+  t = (t & ~QMI_M0_TIMING_CLKDIV_BITS) | (div << QMI_M0_TIMING_CLKDIV_LSB);
+  qmi_hw->m[0].timing = t;
+}
+
 // Initialize hardware and start both animation threads.
 int main()
 {
-  set_sys_clock_khz(300000, true);
+  vreg_set_voltage(VREG_VOLTAGE_1_30);
+  sleep_ms(10);
+  set_flash_divider(4);
+  set_sys_clock_khz(400000, true);
   stdio_init_all();
   initVGA();
 
   COLLIDE_DIST = int2fix15(PEG_RADIUS + BALL_RADIUS);
+
+  buildRows(ball_rows, ball_hw, ball_edge, BALL_RADIUS);
+  buildRows(peg_rows, peg_hw, peg_edge, PEG_RADIUS);
 
   init_audio_dma();
 
@@ -737,9 +837,13 @@ int main()
   gpio_set_dir(ENC_SW, GPIO_IN);
   gpio_pull_up(ENC_SW);
 
-  gpio_init(ISR_GPIO);
-  gpio_set_dir(ISR_GPIO, GPIO_OUT);
-  gpio_put(ISR_GPIO, 0);
+  gpio_init(CORE0_GPIO);
+  gpio_set_dir(CORE0_GPIO, GPIO_OUT);
+  gpio_put(CORE0_GPIO, 0);
+
+  gpio_init(CORE1_GPIO);
+  gpio_set_dir(CORE1_GPIO, GPIO_OUT);
+  gpio_put(CORE1_GPIO, 0);
 
   gpio_init(LED_PIN);
   gpio_set_dir(LED_PIN, GPIO_OUT);

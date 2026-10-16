@@ -37,14 +37,14 @@ pico_sdk_init()
 # must be listed here, or the VGA functions never get compiled/linked.
 add_executable(lab2_week3
         lab2_week3.c
-        VGA/vga16_graphics_v3.c
+        VGA/vga1_graphics.c
 )
 
 # Generate headers from the PIO assembly files.
 # Must come AFTER add_executable, since these attach to the target.
 pico_generate_pio_header(lab2_week3 ${CMAKE_CURRENT_LIST_DIR}/VGA/hsync.pio)
 pico_generate_pio_header(lab2_week3 ${CMAKE_CURRENT_LIST_DIR}/VGA/vsync.pio)
-pico_generate_pio_header(lab2_week3 ${CMAKE_CURRENT_LIST_DIR}/VGA/rgb.pio)
+pico_generate_pio_header(lab2_week3 ${CMAKE_CURRENT_LIST_DIR}/VGA/rgb1.pio)
 
 pico_set_program_name(lab2_week3 "lab2_week3")
 pico_set_program_version(lab2_week3 "0.1")
@@ -67,6 +67,7 @@ target_link_libraries(lab2_week3
         hardware_irq
         hardware_clocks
         hardware_pll
+        hardware_vreg
         )
 
 # Add the standard include files to the build.

@@ -1,0 +1,48 @@
+;
+; 1-bit-per-pixel RGB output for the VGA driver
+; Adapted from Hunter Adams (vha3@cornell.edu) / Bruce Land
+;
+; Runs at 150 MHz (300 MHz sys clock / 2): 6 cycles per pixel = 25 MHz.
+; Autopull refills the OSR every 8 bits, so each DMA byte is 8 pixels,
+; least significant bit first (bit 0 = leftmost pixel).
+; y holds (pixels per line - 1) and is loaded from C before the SM starts.
+
+.program rgb1
+
+.wrap_target
+    set pins, 0             ; blank during sync and porches
+    mov x, y                ; pixel counter for this line
+    wait 1 irq 1 [4]        ; wait for an active line
+colorout:
+    out pins, 1 [6]         ; one pixel: 7 cycles
+    jmp x-- colorout        ; +1 cycle = 8 cycles per pixel
+.wrap
+
+% c-sdk {
+static inline void rgb1_program_init(PIO pio, uint sm, uint offset, uint pin, uint count) {
+    pio_sm_config c = rgb1_program_get_default_config(offset);
+
+    // SET drives all four color pins (to blank them); OUT drives one.
+    sm_config_set_set_pins(&c, pin, 4);
+    sm_config_set_out_pins(&c, pin + 3, 1);      // GPIO 19, green high bit
+
+    // Shift right (LSB first), autopull every 8 bits.
+    sm_config_set_out_shift(&c, true, true, 8);
+
+    sm_config_set_clkdiv(&c, 2);                 // 150 MHz at 300 MHz sys clock
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+
+    for (uint i = 0; i < 4; i++)
+        pio_gpio_init(pio, pin + i);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 4, true);
+
+    pio_sm_init(pio, sm, offset, &c);
+
+    // Load the pixel count into y while the SM is stopped. Pulling it inside
+    // the program with autopull on could let autopull grab the count first.
+    pio_sm_put_blocking(pio, sm, count);
+    pio_sm_exec(pio, sm, pio_encode_pull(false, true));
+    pio_sm_exec(pio, sm, pio_encode_mov(pio_y, pio_osr));
+    pio_sm_exec(pio, sm, pio_encode_out(pio_null, 32));
+}
+%}
