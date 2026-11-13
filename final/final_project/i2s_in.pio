@@ -1,0 +1,19 @@
+.program i2s_in
+.side_set 2
+
+; side-set bit0 = WS (GPIO10), bit1 = SCK (GPIO11)
+; 2 PIO cycles per SCK period, 128 cycles per frame (64 SCK)
+; Only the LEFT slot is sampled: one 32-bit push per frame.
+
+.wrap_target
+    set x, 30      side 0b00    ; SCK low, WS low (left half starts)
+lslot:
+    in pins, 1     side 0b10    ; SCK high, sample SD
+    jmp x-- lslot  side 0b00    ; SCK low
+    in pins, 1     side 0b10    ; 32nd sample of left half
+    set x, 30      side 0b01    ; SCK low, WS high (right half)
+rslot:
+    nop            side 0b11
+    jmp x-- rslot  side 0b01
+    nop            side 0b11
+.wrap
