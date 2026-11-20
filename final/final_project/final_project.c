@@ -8,7 +8,7 @@
 #include "i2s_in.pio.h"
 
 // ---- mode: 1 = 1 kHz sine out of the DAC (step 2.1), 0 = mic passthrough (2.2) ----
-#define TEST_SINE   1
+#define TEST_SINE   0
 #define GAIN_SHIFT  3        // mic gain = 2^GAIN_SHIFT (3 = x8). Keep low for speakers.
 
 #define PIN_WS   10

@@ -60,6 +60,7 @@ target_link_libraries(final_project
         hardware_dma
         hardware_clocks
         hardware_pio
+        hardware_spi
         )
 
 pico_add_extra_outputs(final_project)
