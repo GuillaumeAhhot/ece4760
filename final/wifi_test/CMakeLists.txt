@@ -22,32 +22,32 @@ endif()
 # ====================================================================================
 set(PICO_BOARD pico_w CACHE STRING "Board type")
 
-# Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
 
 project(wifi_test C CXX ASM)
 
-# Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
-add_executable(wifi_test wifi_test.c dhcpserver/dhcpserver.c)
+add_executable(wifi_test
+        wifi_test.c
+        dhcpserver/dhcpserver.c
+        )
 
 pico_set_program_name(wifi_test "wifi_test")
 pico_set_program_version(wifi_test "0.1")
 
-# USB serial on (needed for printf)
 pico_enable_stdio_uart(wifi_test 0)
 pico_enable_stdio_usb(wifi_test 1)
 
-# lwipopts.h lives next to this file, so it must be on the include path
 target_include_directories(wifi_test PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
         ${CMAKE_CURRENT_LIST_DIR}/dhcpserver
-)
+        )
 
 target_link_libraries(wifi_test
         pico_stdlib
         pico_cyw43_arch_lwip_threadsafe_background
+        hardware_watchdog
         )
 
 pico_add_extra_outputs(wifi_test)
